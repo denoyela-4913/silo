@@ -1,0 +1,73 @@
+name: Publish GHCR image (DataShare)
+
+# Fork denoyela-4913/silo : construit l'image serveur depuis un tag RELEASE.* de pgsty/silo
+# et la publie sur GHCR, pour ne pas dépendre de Docker Hub ni d'un registre tiers.
+# Ajout propre au fork, indépendant des workflows d'origine. Image linux/amd64 uniquement.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag RELEASE.* à construire"
+        required: true
+        default: "RELEASE.2026-09-16T00-00-00Z"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/silo
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build silo binary (linux/amd64)
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/dockerscripts
+          LDFLAGS="$(go run buildscripts/gen-ldflags.go)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags kqueue -trimpath \
+            --ldflags "${LDFLAGS}" -o ctx/silo
+          cp Dockerfile.goreleaser LICENSE NOTICE CREDITS ctx/
+          cp dockerscripts/docker-entrypoint.sh dockerscripts/build-static-curl.sh ctx/dockerscripts/
+
+      - name: Build image
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${TAG}" \
+            -t "${IMAGE}:${TAG}" -f ctx/Dockerfile.goreleaser ctx
+
+      - name: Smoke test
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMAGE}:${TAG}" silo --version
+          docker run --rm --entrypoint mcli "${IMAGE}:${TAG}" --version
+
+      - name: Push to GHCR
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE}:${TAG}"
